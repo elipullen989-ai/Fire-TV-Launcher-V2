@@ -29,6 +29,7 @@ import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.AbsListView;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
@@ -74,6 +75,8 @@ public class MainActivity extends Activity {
     private static final String PREF_ORDER = "order";
     private static final String PREF_IMAGE_MODE = "imageMode";
     private static final String PREF_PAUSE_UNTIL = "pauseUntil";
+    private static final String PREF_SAVER_MIN = "screensaverMin";
+    private static final long SAVER_SLIDE_MS = 15000;   // how long each screensaver picture stays
     private static final long AMAZON_PAUSE_MS = 5 * 60 * 1000;   // time you get on Amazon's home
     private static final int MODE_BANNER = 0;       // pictures in a banner at the top
     private static final int MODE_BACKGROUND = 1;   // pictures behind everything
@@ -218,6 +221,7 @@ public class MainActivity extends Activity {
         boolean isBanner;
         boolean themePicker;
         boolean picturePicker;
+        boolean screensaverPicker;
         boolean amazonHome;
         boolean fixed;      // Themes and Settings tiles stay at the end and can't be moved
     }
@@ -229,6 +233,18 @@ public class MainActivity extends Activity {
     private GridView grid;
     private int movingPos = -1;   // index of the app being moved, or -1
     private int imageMode = MODE_BANNER;
+
+    // Screensaver state
+    private int screensaverMin = 0;          // 0 = off
+    private FrameLayout stageView;           // the whole screen; the screensaver is added on top
+    private FrameLayout saverView;           // non-null while the screensaver is showing
+    private ImageView saverFront;
+    private ImageView saverBack;
+    private List<File> saverFiles = new ArrayList<>();
+    private int saverIndex = 0;
+    private int saverGeneration = 0;         // bumped to cancel stale picture loads
+    private final Runnable idleStart = () -> showScreensaver(false);
+    private final Runnable saverNext = () -> showNextSaverSlide();
     private FrameLayout bannerFrame;   // the picture banner (banner mode only)
 
     // Slideshow state
@@ -262,6 +278,7 @@ public class MainActivity extends Activity {
             }
         }
         imageMode = prefs.getInt(PREF_IMAGE_MODE, MODE_BANNER);
+        screensaverMin = prefs.getInt(PREF_SAVER_MIN, 0);
         createPictureFolders();
         buildUi();
     }
@@ -282,6 +299,8 @@ public class MainActivity extends Activity {
         super.onResume();
         loadApps();
         startSlideshow();
+        applyKeepScreenOn();
+        resetIdleTimer();
     }
 
     @Override
@@ -289,6 +308,8 @@ public class MainActivity extends Activity {
         super.onPause();
         movingPos = -1;
         stopSlideshow();
+        handler.removeCallbacks(idleStart);
+        dismissSaverQuietly();
     }
 
     @Override
@@ -324,6 +345,14 @@ public class MainActivity extends Activity {
     /** While an app is being moved, the D-pad moves the app instead of the highlight. */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        resetIdleTimer();
+        if (saverView != null) {
+            // Any button just closes the screensaver; it does nothing else.
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                hideScreensaver();
+            }
+            return true;
+        }
         if (movingPos < 0) {
             return super.dispatchKeyEvent(event);
         }
@@ -422,7 +451,9 @@ public class MainActivity extends Activity {
 
     private void buildUi() {
         // Bottom to top: plain background, picture layers, dark scrim, then the home screen.
+        dismissSaverQuietly();
         FrameLayout stage = new FrameLayout(this);
+        stageView = stage;
         if (theme.field) {
             stage.setBackground(new FieldDrawable(theme.bgTop, theme.bgBottom));
         } else {
@@ -537,6 +568,8 @@ public class MainActivity extends Activity {
                 showThemePicker();
             } else if (entry.picturePicker) {
                 showPicturePicker();
+            } else if (entry.screensaverPicker) {
+                showScreensaverPicker();
             } else {
                 if (entry.amazonHome) {
                     // Stop the auto-open service from bouncing you straight back.
@@ -798,6 +831,148 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    // ---------------------------------------------------------------- Screensaver
+
+    /** Restart the idle countdown. Called on every button press. */
+    private void resetIdleTimer() {
+        handler.removeCallbacks(idleStart);
+        if (screensaverMin > 0 && saverView == null && movingPos < 0) {
+            handler.postDelayed(idleStart, screensaverMin * 60L * 1000L);
+        }
+    }
+
+    /** While the screensaver is turned on, keep the TV awake so Fire TV's own one doesn't start. */
+    private void applyKeepScreenOn() {
+        if (screensaverMin > 0) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    private void showScreensaver(boolean preview) {
+        if (saverView != null || stageView == null) {
+            return;
+        }
+        if (!preview && !hasWindowFocus()) {
+            resetIdleTimer();   // a menu is open; try again later
+            return;
+        }
+        // Pictures from the current theme's folder; if it is empty, from any theme's folder.
+        List<File> pics = listSlides(theme);
+        if (pics.isEmpty()) {
+            for (AppTheme t : THEMES) {
+                pics.addAll(listSlides(t));
+            }
+        }
+        if (pics.isEmpty()) {
+            if (preview) {
+                Toast.makeText(this, "No pictures found. Add some to the "
+                        + theme.folder + " folder first.", Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        Collections.shuffle(pics);
+        saverFiles = pics;
+        saverIndex = 0;
+
+        final int match = ViewGroup.LayoutParams.MATCH_PARENT;
+        FrameLayout layer = new FrameLayout(this);
+        layer.setBackgroundColor(Color.BLACK);
+        saverFront = newPictureView();
+        saverBack = newPictureView();
+        saverBack.setAlpha(0f);
+        layer.addView(saverFront, new FrameLayout.LayoutParams(match, match));
+        layer.addView(saverBack, new FrameLayout.LayoutParams(match, match));
+
+        TextClock clock = new TextClock(this);
+        clock.setFormat12Hour("h:mm a");
+        clock.setFormat24Hour("HH:mm");
+        clock.setTextColor(Color.WHITE);
+        clock.setTextSize(30);
+        clock.setShadowLayer(8, 0, 2, Color.BLACK);
+        FrameLayout.LayoutParams clockParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.END | Gravity.BOTTOM);
+        clockParams.setMargins(0, 0, dp(48), dp(36));
+        layer.addView(clock, clockParams);
+
+        stageView.addView(layer, new FrameLayout.LayoutParams(match, match));
+        saverView = layer;
+        stopSlideshow();   // pause the banner/background slideshow while the screensaver runs
+        showNextSaverSlide();
+    }
+
+    private void showNextSaverSlide() {
+        if (saverView == null || saverFiles.isEmpty()) {
+            return;
+        }
+        final int generation = saverGeneration;
+        final File file = saverFiles.get(saverIndex % saverFiles.size());
+        saverIndex++;
+        new Thread(() -> {
+            final Bitmap bmp = decodeScaled(file, 1920, 1080);
+            runOnUiThread(() -> {
+                if (generation != saverGeneration || saverView == null) {
+                    return;   // dismissed while this was loading
+                }
+                if (bmp != null) {
+                    fadePair(saverFront, saverBack, bmp);
+                }
+                handler.postDelayed(saverNext, SAVER_SLIDE_MS);
+            });
+        }).start();
+    }
+
+    /** Remove the screensaver without restarting anything else. */
+    private void dismissSaverQuietly() {
+        saverGeneration++;
+        handler.removeCallbacks(saverNext);
+        if (saverView != null && stageView != null) {
+            stageView.removeView(saverView);
+        }
+        saverView = null;
+        saverFront = null;
+        saverBack = null;
+    }
+
+    private void hideScreensaver() {
+        dismissSaverQuietly();
+        startSlideshow();
+        resetIdleTimer();
+    }
+
+    private void showScreensaverPicker() {
+        CharSequence[] items = {"Off", "5 minutes", "10 minutes", "15 minutes", "20 minutes"};
+        final int[] minutes = {0, 5, 10, 15, 20};
+        int checked = 0;
+        for (int i = 0; i < minutes.length; i++) {
+            if (minutes[i] == screensaverMin) {
+                checked = i;
+            }
+        }
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Screensaver")
+                .setSingleChoiceItems(items, checked, (dialog, which) -> {
+                    dialog.dismiss();
+                    applyScreensaver(minutes[which]);
+                })
+                .setPositiveButton("Preview now", (dialog, which) ->
+                        handler.postDelayed(() -> showScreensaver(true), 300))
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void applyScreensaver(int minutes) {
+        screensaverMin = minutes;
+        prefs.edit().putInt(PREF_SAVER_MIN, minutes).apply();
+        applyKeepScreenOn();
+        resetIdleTimer();
+        Toast.makeText(this, minutes == 0 ? "Screensaver is off"
+                : "Screensaver starts after " + minutes + " minutes without a button press",
+                Toast.LENGTH_LONG).show();
+    }
+
     private void showPicturePicker() {
         CharSequence[] items = {"Banner at the top", "Full-screen background",
                 "Banner + background", "Off"};
@@ -926,6 +1101,16 @@ public class MainActivity extends Activity {
         pictures.isBanner = true;
         found.add(pictures);
 
+        // Screensaver settings
+        AppEntry saver = new AppEntry();
+        saver.label = "Screensaver";
+        saver.packageName = "screensaver";
+        saver.screensaverPicker = true;
+        saver.fixed = true;
+        saver.image = getResources().getDrawable(android.R.drawable.ic_menu_slideshow);
+        saver.isBanner = false;
+        found.add(saver);
+
         // A way to reach Amazon's own home screen when auto-open is turned on.
         AppEntry amazon = new AppEntry();
         amazon.label = "Amazon Home";
@@ -964,7 +1149,7 @@ public class MainActivity extends Activity {
     }
 
     private void openAppInfo(AppEntry entry) {
-        if (entry.themePicker || entry.picturePicker || entry.amazonHome
+        if (entry.themePicker || entry.picturePicker || entry.screensaverPicker || entry.amazonHome
                 || "settings".equals(entry.packageName)) {
             return;
         }
