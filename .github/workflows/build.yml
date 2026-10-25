@@ -1,0 +1,40 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show top-level files
+        run: |
+          echo "::notice title=Top-level files::$(ls -A | tr '\n' ' ')"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.2
+          cache-disabled: true
+
+      - name: Build release APK
+        run: |
+          set -o pipefail
+          gradle assembleRelease --no-daemon --console=plain 2>&1 | tee build.log || {
+            echo "::error title=Gradle build failed::$(grep -E -A6 'What went wrong|error:|FAILURE|does not contain|Could not' build.log | head -30 | tr '\n' ' ')"
+            exit 1
+          }
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-launcher-apk
+          path: app/build/outputs/apk/release/app-release.apk
