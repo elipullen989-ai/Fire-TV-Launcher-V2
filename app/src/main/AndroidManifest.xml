@@ -3,6 +3,9 @@
 
     <!-- Deliberately NO INTERNET permission: this launcher cannot load ads or send data anywhere. -->
 
+    <!-- Lets the Home redirect open the launcher from the background (grant it with ADB, see README). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <uses-feature
         android:name="android.hardware.touchscreen"
         android:required="false" />
