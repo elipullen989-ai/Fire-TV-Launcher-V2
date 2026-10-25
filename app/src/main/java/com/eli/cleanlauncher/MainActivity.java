@@ -1,5 +1,6 @@
 package com.eli.cleanlauncher;
 
+import android.animation.LayoutTransition;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
@@ -29,6 +30,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
+import android.widget.AdapterView;
 import android.widget.BaseAdapter;
 import android.widget.FrameLayout;
 import android.widget.GridView;
@@ -57,7 +59,9 @@ import java.util.Set;
  * three-lines button) or open the "Themes" tile to switch themes.
  *
  * Each theme can show a slideshow of your own pictures, as a banner at the top, as
- * the full-screen background, or both at once (Pictures tile). Put images
+ * the full-screen background, or both at once with different pictures (Pictures tile).
+ * The banner sits above the apps like Fire TV's featured ad and slides away when you
+ * move down to the lower rows. Put images
  * in: /sdcard/Android/data/com.eli.cleanlauncher/files/backgrounds/THEME_FOLDER/
  * (folders are created the first time the launcher opens). With no pictures, the
  * theme's plain background is used.
@@ -69,6 +73,8 @@ public class MainActivity extends Activity {
     private static final String PREF_THEME = "themeName";
     private static final String PREF_ORDER = "order";
     private static final String PREF_IMAGE_MODE = "imageMode";
+    private static final String PREF_PAUSE_UNTIL = "pauseUntil";
+    private static final long AMAZON_PAUSE_MS = 5 * 60 * 1000;   // time you get on Amazon's home
     private static final int MODE_BANNER = 0;       // pictures in a banner at the top
     private static final int MODE_BACKGROUND = 1;   // pictures behind everything
     private static final int MODE_OFF = 2;          // no pictures
@@ -212,6 +218,7 @@ public class MainActivity extends Activity {
         boolean isBanner;
         boolean themePicker;
         boolean picturePicker;
+        boolean amazonHome;
         boolean fixed;      // Themes and Settings tiles stay at the end and can't be moved
     }
 
@@ -227,6 +234,7 @@ public class MainActivity extends Activity {
     // Slideshow state
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable nextSlide = () -> showNextSlide();
+    private boolean bannerOnTopRow = true;  // false once you move down past the first row
     private ImageView bannerFront;  // banner picture currently showing (banner modes)
     private ImageView bannerBack;   // banner picture fading in
     private ImageView bgFront;      // the picture currently showing
@@ -449,6 +457,8 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setLayoutTransition(new LayoutTransition());   // banner slides in and out smoothly
+        bannerOnTopRow = true;
 
         // Header: title on the left, clock on the right
         FrameLayout header = new FrameLayout(this);
@@ -528,12 +538,32 @@ public class MainActivity extends Activity {
             } else if (entry.picturePicker) {
                 showPicturePicker();
             } else {
+                if (entry.amazonHome) {
+                    // Stop the auto-open service from bouncing you straight back.
+                    prefs.edit().putLong(PREF_PAUSE_UNTIL,
+                            System.currentTimeMillis() + AMAZON_PAUSE_MS).apply();
+                }
                 launch(entry);
             }
         });
         grid.setOnItemLongClickListener((parent, view, position, id) -> {
             showItemMenu(apps.get(position), position);
             return true;
+        });
+
+        grid.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                boolean top = position < COLUMNS;
+                if (top != bannerOnTopRow) {
+                    bannerOnTopRow = top;
+                    updateBannerVisibility();
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
         });
 
         root.addView(grid, new LinearLayout.LayoutParams(
@@ -616,9 +646,7 @@ public class MainActivity extends Activity {
         if (scrimView != null) {
             scrimView.setVisibility(slides.isEmpty() ? View.GONE : View.VISIBLE);
         }
-        if (bannerFrame != null) {
-            bannerFrame.setVisibility(slides.isEmpty() ? View.GONE : View.VISIBLE);
-        }
+        updateBannerVisibility();
         if (slides.isEmpty()) {
             if (bgFront != null) {
                 bgFront.setImageDrawable(null);
@@ -643,17 +671,20 @@ public class MainActivity extends Activity {
             return;
         }
         final int generation = slideGeneration;
-        final File file = slides.get(slideIndex % slides.size());
+        final int n = slides.size();
+        final File fileA = slides.get(slideIndex % n);
+        final boolean both = bannerFront != null && bgFront != null;
+        // With the banner and the background both showing, they get different pictures.
+        final File fileB = both ? slides.get((slideIndex + Math.max(1, n / 2)) % n) : fileA;
         slideIndex++;
         new Thread(() -> {
-            final Bitmap bmp = decodeScaled(file, 1280, 720);
+            final Bitmap a = decodeScaled(fileA, 1280, 720);
+            final Bitmap b = (both && fileB != fileA) ? decodeScaled(fileB, 1280, 720) : a;
             runOnUiThread(() -> {
                 if (generation != slideGeneration) {
                     return; // theme changed or screen left while this was loading
                 }
-                if (bmp != null) {
-                    crossfadeTo(bmp);
-                }
+                showBitmaps(a, b != null ? b : a);
                 handler.postDelayed(nextSlide, SLIDE_MS);
             });
         }).start();
@@ -665,10 +696,22 @@ public class MainActivity extends Activity {
         return v;
     }
 
-    /** Fade the new picture in on the banner and/or the background, whichever are showing. */
-    private void crossfadeTo(Bitmap bmp) {
-        fadePair(bgFront, bgBack, bmp);
-        fadePair(bannerFront, bannerBack, bmp);
+    /** Fade new pictures in: the banner gets one, the background gets the other. */
+    private void showBitmaps(Bitmap forBanner, Bitmap forBackground) {
+        if (forBanner != null) {
+            fadePair(bannerFront, bannerBack, forBanner);
+        }
+        if (forBackground != null) {
+            fadePair(bgFront, bgBack, forBackground);
+        }
+    }
+
+    /** Fire TV style: the banner shows while you are on the top row of apps and slides away below. */
+    private void updateBannerVisibility() {
+        if (bannerFrame != null) {
+            boolean show = !slides.isEmpty() && bannerOnTopRow;
+            bannerFrame.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
     }
 
     private void fadePair(final ImageView front, final ImageView back, Bitmap bmp) {
@@ -883,6 +926,20 @@ public class MainActivity extends Activity {
         pictures.isBanner = true;
         found.add(pictures);
 
+        // A way to reach Amazon's own home screen when auto-open is turned on.
+        AppEntry amazon = new AppEntry();
+        amazon.label = "Amazon Home";
+        amazon.packageName = "amazonhome";
+        amazon.amazonHome = true;
+        amazon.fixed = true;
+        amazon.intent = new Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_HOME)
+                .setPackage("com.amazon.tv.launcher")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        amazon.image = getResources().getDrawable(android.R.drawable.ic_menu_revert);
+        amazon.isBanner = false;
+        found.add(amazon);
+
         // Always provide a way into system settings.
         AppEntry settings = new AppEntry();
         settings.label = "Settings";
@@ -907,7 +964,8 @@ public class MainActivity extends Activity {
     }
 
     private void openAppInfo(AppEntry entry) {
-        if (entry.themePicker || "settings".equals(entry.packageName)) {
+        if (entry.themePicker || entry.picturePicker || entry.amazonHome
+                || "settings".equals(entry.packageName)) {
             return;
         }
         try {
