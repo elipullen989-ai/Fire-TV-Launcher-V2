@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="home_redirect_description">Opens Clean Launcher when Amazon\'s home screen appears. It only watches for that screen and does not read anything else.</string>
+</resources>
