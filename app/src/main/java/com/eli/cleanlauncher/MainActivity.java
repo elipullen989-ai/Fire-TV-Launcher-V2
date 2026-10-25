@@ -56,8 +56,8 @@ import java.util.Set;
  * (Move, to rearrange apps with the arrow buttons, or App info). Press MENU (the
  * three-lines button) or open the "Themes" tile to switch themes.
  *
- * Each theme can show a slideshow of your own pictures, as a banner at the top or as
- * the full-screen background (Pictures tile). Put images
+ * Each theme can show a slideshow of your own pictures, as a banner at the top, as
+ * the full-screen background, or both at once (Pictures tile). Put images
  * in: /sdcard/Android/data/com.eli.cleanlauncher/files/backgrounds/THEME_FOLDER/
  * (folders are created the first time the launcher opens). With no pictures, the
  * theme's plain background is used.
@@ -72,6 +72,7 @@ public class MainActivity extends Activity {
     private static final int MODE_BANNER = 0;       // pictures in a banner at the top
     private static final int MODE_BACKGROUND = 1;   // pictures behind everything
     private static final int MODE_OFF = 2;          // no pictures
+    private static final int MODE_COMBINED = 3;     // banner at the top AND full-screen background
     private static final long SLIDE_MS = 12000;   // how long each picture stays up
     private static final long FADE_MS = 1200;     // crossfade between pictures
 
@@ -226,6 +227,8 @@ public class MainActivity extends Activity {
     // Slideshow state
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable nextSlide = () -> showNextSlide();
+    private ImageView bannerFront;  // banner picture currently showing (banner modes)
+    private ImageView bannerBack;   // banner picture fading in
     private ImageView bgFront;      // the picture currently showing
     private ImageView bgBack;       // fades in on top, then is copied to bgFront
     private View scrimView;         // dark overlay, visible only while pictures are showing
@@ -420,23 +423,24 @@ public class MainActivity extends Activity {
                     new int[]{theme.bgTop, theme.bgBottom}));
         }
 
-        // Two stacked picture layers; the top one fades in over the other.
+        // Picture layers come in pairs; the top one fades in over the other.
         final int match = ViewGroup.LayoutParams.MATCH_PARENT;
-        bgFront = new ImageView(this);
-        bgFront.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        bgBack = new ImageView(this);
-        bgBack.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        bgBack.setAlpha(0f);
-        FrameLayout pictures = new FrameLayout(this);
-        pictures.addView(bgFront, new FrameLayout.LayoutParams(match, match));
-        pictures.addView(bgBack, new FrameLayout.LayoutParams(match, match));
-
-        // Background mode: pictures fill the screen with a dark scrim over them.
-        // Banner mode adds them to the home screen below. Off mode shows no pictures.
+        bgFront = null;
+        bgBack = null;
+        bannerFront = null;
+        bannerBack = null;
         scrimView = null;
         bannerFrame = null;
-        if (imageMode == MODE_BACKGROUND) {
-            stage.addView(pictures, new FrameLayout.LayoutParams(match, match));
+
+        // Background (and Combined) mode: pictures fill the screen with a dark scrim over them.
+        if (imageMode == MODE_BACKGROUND || imageMode == MODE_COMBINED) {
+            bgFront = newPictureView();
+            bgBack = newPictureView();
+            bgBack.setAlpha(0f);
+            FrameLayout layers = new FrameLayout(this);
+            layers.addView(bgFront, new FrameLayout.LayoutParams(match, match));
+            layers.addView(bgBack, new FrameLayout.LayoutParams(match, match));
+            stage.addView(layers, new FrameLayout.LayoutParams(match, match));
             scrimView = new View(this);
             scrimView.setBackgroundColor(theme.scrim);
             scrimView.setVisibility(View.GONE);
@@ -482,8 +486,12 @@ public class MainActivity extends Activity {
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(6)));
         }
 
-        // Picture banner, where Fire TV puts its featured ad. Hidden until there are pictures.
-        if (imageMode == MODE_BANNER) {
+        // Picture banner, where Fire TV puts its featured ad. It sits above the app grid, not
+        // inside it, so it stays put while you scroll. Hidden until there are pictures.
+        if (imageMode == MODE_BANNER || imageMode == MODE_COMBINED) {
+            bannerFront = newPictureView();
+            bannerBack = newPictureView();
+            bannerBack.setAlpha(0f);
             GradientDrawable frameBg = new GradientDrawable();
             frameBg.setCornerRadius(dp(theme.radiusDp));
             frameBg.setColor(theme.cards[0]);
@@ -491,7 +499,8 @@ public class MainActivity extends Activity {
             bannerFrame.setBackground(frameBg);
             bannerFrame.setClipToOutline(true);
             bannerFrame.setVisibility(View.GONE);
-            bannerFrame.addView(pictures, new FrameLayout.LayoutParams(match, match));
+            bannerFrame.addView(bannerFront, new FrameLayout.LayoutParams(match, match));
+            bannerFrame.addView(bannerBack, new FrameLayout.LayoutParams(match, match));
             LinearLayout.LayoutParams bannerParams = new LinearLayout.LayoutParams(match, dp(170));
             bannerParams.setMargins(dp(48), dp(12), dp(48), 0);
             root.addView(bannerFrame, bannerParams);
@@ -592,7 +601,8 @@ public class MainActivity extends Activity {
         for (File f : files) {
             String n = f.getName().toLowerCase(Locale.ROOT);
             if (f.isFile() && (n.endsWith(".jpg") || n.endsWith(".jpeg")
-                    || n.endsWith(".png") || n.endsWith(".webp"))) {
+                    || n.endsWith(".png") || n.endsWith(".webp")
+                    || n.endsWith(".jfif"))) {
                 out.add(f);
             }
         }
@@ -612,6 +622,9 @@ public class MainActivity extends Activity {
         if (slides.isEmpty()) {
             if (bgFront != null) {
                 bgFront.setImageDrawable(null);
+            }
+            if (bannerFront != null) {
+                bannerFront.setImageDrawable(null);
             }
             return;
         }
@@ -646,9 +659,19 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    private ImageView newPictureView() {
+        ImageView v = new ImageView(this);
+        v.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        return v;
+    }
+
+    /** Fade the new picture in on the banner and/or the background, whichever are showing. */
     private void crossfadeTo(Bitmap bmp) {
-        final ImageView front = bgFront;
-        final ImageView back = bgBack;
+        fadePair(bgFront, bgBack, bmp);
+        fadePair(bannerFront, bannerBack, bmp);
+    }
+
+    private void fadePair(final ImageView front, final ImageView back, Bitmap bmp) {
         if (front == null || back == null) {
             return;
         }
@@ -733,12 +756,20 @@ public class MainActivity extends Activity {
     }
 
     private void showPicturePicker() {
-        CharSequence[] items = {"Banner at the top", "Full-screen background", "Off"};
+        CharSequence[] items = {"Banner at the top", "Full-screen background",
+                "Banner + background", "Off"};
+        final int[] modes = {MODE_BANNER, MODE_BACKGROUND, MODE_COMBINED, MODE_OFF};
+        int checked = 0;
+        for (int i = 0; i < modes.length; i++) {
+            if (modes[i] == imageMode) {
+                checked = i;
+            }
+        }
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Pictures")
-                .setSingleChoiceItems(items, imageMode, (dialog, which) -> {
+                .setSingleChoiceItems(items, checked, (dialog, which) -> {
                     dialog.dismiss();
-                    applyImageMode(which);
+                    applyImageMode(modes[which]);
                 })
                 .show();
     }
